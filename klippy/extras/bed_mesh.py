@@ -4,8 +4,65 @@
 # Copyright (C) 2018-2019 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, math, json, collections
+import logging, logging.handlers, math, json, collections, os
 from . import probe
+
+
+# ---------------------------------------------------------------------------
+# GK: Dedicated bed_mesh diagnostic logger
+# ---------------------------------------------------------------------------
+# All GK-added diagnostic messages (ACTIVE_MESH_SNAPSHOT, MESH_GRID_LOG,
+# PROBED_MATRIX_LOG, profile manager traces) go to a SEPARATE log file so
+# they never flood klippy.log.
+#
+# Log location : same directory as klippy.log  →  bed_mesh_debug.log
+# Rotation     : daily at midnight (TimedRotatingFileHandler)
+# Retention    : 10 backups = 10 days of history
+# propagate    : False  → messages do NOT reach the root logger / klippy.log
+# ---------------------------------------------------------------------------
+def _setup_bedmesh_logger():
+    logger_name = "bed_mesh.gk_diag"
+    log = logging.getLogger(logger_name)
+    if log.handlers:
+        return log          # already configured (module reload guard)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False   # CRITICAL: must not bleed into klippy.log
+
+    # Discover the directory where klippy.log lives by inspecting root handlers
+    log_dir = "/tmp"
+    for h in logging.root.handlers:
+        fname = getattr(h, 'baseFilename', None)
+        if not fname:
+            stream = getattr(h, 'stream', None)
+            fname = getattr(stream, 'name', None)
+        if fname and isinstance(fname, str) and fname not in ('<stderr>', '<stdout>'):
+            log_dir = os.path.dirname(os.path.abspath(fname)) or "/tmp"
+            break
+
+    log_path = os.path.join(log_dir, "bed_mesh_debug.log")
+
+    try:
+        handler = logging.handlers.TimedRotatingFileHandler(
+            log_path,
+            when="midnight",
+            interval=1,
+            backupCount=10,     # keep 10 days
+            encoding="utf-8",
+            utc=False,
+        )
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        log.addHandler(handler)
+        logging.info("bed_mesh: dedicated diagnostic log → %s" % log_path)
+    except Exception as _ex:
+        logging.warning("bed_mesh: could not create bed_mesh_debug.log: %s" % _ex)
+
+    return log
+
+_BM_LOG = _setup_bedmesh_logger()
+# ---------------------------------------------------------------------------
 
 PROFILE_VERSION = 1
 PROFILE_OPTIONS = {
@@ -138,6 +195,7 @@ class BedMesh:
         # initialize status dict
         self.update_status()
     def _get_mesh(self, web_request):
+        #GKComment: Used by Creality webUI
         probed_matrix = [[]]
         try:
             probed_matrix = self.z_mesh.get_probed_matrix()
@@ -145,13 +203,35 @@ class BedMesh:
             logging.error(err)
         web_request.send({'probed_matrix': probed_matrix})
     def update_mesh(self, web_request):
+        # ----------------------------------------------------------------
+        # update_mesh — called by Creality UI when viewing the mesh page.
+        #
+        # FIX (#6): Removed save_profile() + load_profile() cycle.
+        # Problem: save_profile writes floats to configfile (6 decimal places),
+        # then load_profile reads them back — this rounding cycle modifies the
+        # mesh values slightly every time Creality UI opens the mesh page.
+        # This caused the "always different mesh" issue between Fluidd and
+        # Creality UI.
+        #
+        # FIX: Only update in-memory. No save, no reload, no disk write.
+        # User must explicitly run CXSAVE_CONFIG or SAVE_CONFIG to persist.
+        # ----------------------------------------------------------------
         probed_matrix = web_request.get("probed_matrix", [[]])
         self.z_mesh.update_mesh_probed_matrix(probed_matrix)
         self.set_mesh(self.z_mesh)
         self.update_status()
-        self.save_profile(self.pmgr.get_current_profile())
-        self.load_profile(self.pmgr.get_current_profile())
-        self.gcode.run_script_from_command('CXSAVE_CONFIG')
+        # REMOVED: self.save_profile(self.pmgr.get_current_profile())
+        # REMOVED: self.load_profile(self.pmgr.get_current_profile())
+        # REMOVED: self.gcode.run_script_from_command('CXSAVE_CONFIG')
+        # All three removed to prevent the save/reload rounding cycle and
+        # silent overwrite of calibrated mesh from UI.
+        self.gcode.respond_info(
+            "bed_mesh: Mesh updated in memory (profile='%s'). "
+            "WARNING: NOT saved to disk. Run CXSAVE_CONFIG or SAVE_CONFIG "
+            "to persist." % self.pmgr.get_current_profile())
+        _BM_LOG.info(
+            "bed_mesh: update_mesh via webhook — memory only, "
+            "save_profile/load_profile/CXSAVE_CONFIG all skipped intentionally.")
         probed_matrix = self.z_mesh.get_probed_matrix()
         web_request.send({'probed_matrix': probed_matrix})
     def handle_connect(self):
@@ -192,6 +272,41 @@ class BedMesh:
         # cache the current position before a transform takes place
         gcode_move = self.printer.lookup_object('gcode_move')
         gcode_move.reset_last_position()
+        # GK: Log full mesh data + z-offset whenever a mesh is activated.
+        # This fires on: default profile load at boot, BED_MESH_CALIBRATE,
+        # BED_MESH_PROFILE LOAD, BED_MESH_RESTORE, and update_mesh webhook.
+        # Check klippy.log for "ACTIVE_MESH_SNAPSHOT" to see what was loaded.
+        if mesh is not None:
+            try:
+                z_offset_val = gcode_move.homing_position[2]
+                probed = mesh.get_probed_matrix()
+                x_cnt = mesh.mesh_params.get('x_count', '?')
+                y_cnt = mesh.mesh_params.get('y_count', '?')
+                total_pts = sum(len(row) for row in probed) if probed else 0
+                profile_name = self.pmgr.get_current_profile() \
+                    if hasattr(self, 'pmgr') else '?'
+                min_z_val, max_z_val = mesh.get_z_range()
+                lines = [
+                    "bed_mesh: ACTIVE_MESH_SNAPSHOT",
+                    "  profile     : [%s]" % profile_name,
+                    "  z_offset    : %.6f  (gcode_move.homing_position[2])"
+                        % z_offset_val,
+                    "  grid        : x_count=%s  y_count=%s  total=%d points"
+                        % (x_cnt, y_cnt, total_pts),
+                    "  avg_z       : %.6f" % mesh.avg_z,
+                    "  z_range     : min=%.6f  max=%.6f" % (min_z_val, max_z_val),
+                    "  probed_matrix (row index = Y low->high, "
+                        "col index = X low->high):",
+                ]
+                for row_idx, row in enumerate(probed):
+                    row_str = "  ".join(["%+.6f" % v for v in row])
+                    lines.append("    row[%02d]: %s" % (row_idx, row_str))
+                _BM_LOG.info("\n".join(lines))
+            except Exception as _log_ex:
+                _BM_LOG.warning(
+                    "bed_mesh: ACTIVE_MESH_SNAPSHOT log failed: %s" % _log_ex)
+        else:
+            _BM_LOG.info("bed_mesh: ACTIVE_MESH_SNAPSHOT — mesh cleared (None)")
         self.update_status()
     def get_z_factor(self, z_pos):
         if z_pos >= self.fade_end:
@@ -909,13 +1024,18 @@ class ZMesh:
     def get_mesh_params(self):
         return self.mesh_params
     def print_probed_matrix(self, print_func):
+        msg = "Mesh Bed Leveling Probed Unavailable\n"
         if self.probed_matrix is not None:
-            msg = "Mesh Leveling Probed Z positions:\n"
+            msg = "Mesh Leveling Probed Points:\n"
             for line in self.probed_matrix:
-                for x in line:
-                    msg += " %f" % x
+                msg += " ".join(["%f" % pt for pt in line])
                 msg += "\n"
-            print_func(msg)
+        print_func(msg)
+        # GK: Also mirror to klippy.log at INFO so it's always recorded,
+        # regardless of whether the caller is gcmd.respond_info (console only)
+        # or logging.debug (filtered). Search "PROBED_MATRIX_LOG" in klippy.log.
+        if print_func is not logging.info and print_func is not logging.debug:
+            _BM_LOG.info("bed_mesh: PROBED_MATRIX_LOG\n" + msg.rstrip())
         else:
             print_func("bed_mesh: bed has not been probed")
     def print_mesh(self, print_func, move_z=None):
@@ -937,8 +1057,16 @@ class ZMesh:
                     msg += "  %f" % (z)
                 msg += "\n"
             print_func(msg)
+            # GK: Always mirror interpolated mesh to klippy.log at INFO level.
+            # build_mesh() calls print_mesh(logging.debug) — DEBUG is often
+            # filtered. cmd_BED_MESH_OUTPUT calls with gcmd.respond_raw —
+            # console only, never in klippy.log. Search "MESH_GRID_LOG".
+            if print_func is not logging.info:
+                _BM_LOG.info("bed_mesh: MESH_GRID_LOG\n" + msg.rstrip())
         else:
             print_func("bed_mesh: Z Mesh not generated")
+            if print_func is not logging.info:
+                _BM_LOG.info("bed_mesh: MESH_GRID_LOG — Z Mesh not generated")
     def build_mesh(self, z_matrix):
         self.probed_matrix = z_matrix
         self._sample(z_matrix)
@@ -1200,8 +1328,13 @@ class ProfileManager:
         if "default" in self.profiles:
             self.load_profile("default")
     def get_profiles(self):
+        _BM_LOG.info("bed_mesh: get_profiles() called — known profiles: [%s]"
+                     % ", ".join(self.profiles.keys()) if self.profiles
+                     else "bed_mesh: get_profiles() called — no profiles stored")
         return self.profiles
     def get_current_profile(self):
+        _BM_LOG.info("bed_mesh: get_current_profile() = [%s]"
+                     % self.current_profile)
         return self.current_profile
     def _check_incompatible_profiles(self):
         if self.incompatible_profiles:
@@ -1215,8 +1348,11 @@ class ProfileManager:
                 "file and restart the printer" %
                 (('\n').join(self.incompatible_profiles)))
     def save_profile(self, prof_name):
+        _BM_LOG.info("bed_mesh: save_profile('%s') called" % prof_name)
         z_mesh = self.bedmesh.get_mesh()
         if z_mesh is None:
+            _BM_LOG.warning("bed_mesh: save_profile('%s') — no active mesh, "
+                            "nothing to save" % prof_name)
             self.gcode.respond_info(
                 "Unable to save to profile [%s], the bed has not been probed"
                 % (prof_name))
@@ -1251,35 +1387,68 @@ class ProfileManager:
             "update the printer config file and restart the printer."
             % (prof_name))
     def load_profile(self, prof_name):
+        available = list(self.profiles.keys())
+        _BM_LOG.info("bed_mesh: load_profile('%s') called — available profiles: [%s]"
+                     % (prof_name, ", ".join(available) if available else "<none>"))
         profile = self.profiles.get(prof_name, None)
         if profile is not None:
             probed_matrix = profile['points']
             mesh_params = profile['mesh_params']
+            total_pts = sum(len(r) for r in probed_matrix) if probed_matrix else 0
+            _BM_LOG.info(
+                "bed_mesh: load_profile('%s') — found profile, "
+                "grid x_count=%s y_count=%s total=%d points, building mesh..."
+                % (prof_name,
+                   mesh_params.get('x_count', '?'),
+                   mesh_params.get('y_count', '?'),
+                   total_pts))
             z_mesh = ZMesh(mesh_params,self.printer)
             try:
                 z_mesh.build_mesh(probed_matrix)
             except BedMeshError as e:
                 raise self.gcode.error(str(e))
             self.current_profile = prof_name
+            _BM_LOG.info("bed_mesh: load_profile('%s') — mesh built, "
+                         "activating via set_mesh()" % prof_name)
             self.bedmesh.set_mesh(z_mesh)
         else:
-            self.gcode.respond_info("bed_mesh: Unknown profile [%s]" % (prof_name,))
+            # LOG: profile not found — no mesh will be active after this call.
+            # This happens on first boot (no saved mesh), after SAVE_CONFIG failed,
+            # or if BED_MESH_PROFILE REMOVE was called.
+            # Printing without a mesh means no bed leveling compensation will run.
+            msg = (
+                "bed_mesh: WARNING — profile [%s] not found. "
+                "No mesh loaded. Bed leveling will NOT be applied. "
+                "Run BED_MESH_CALIBRATE to create a mesh."
+                % (prof_name,)
+            )
+            self.gcode.respond_info(msg)
+            _BM_LOG.warning("bed_mesh: load_profile('%s') — profile not found, "
+                            "no mesh active." % prof_name)
             # raise self.gcode.error(
             #     "bed_mesh: Unknown profile [%s]" % prof_name)
 
     def remove_profile(self, prof_name):
+        _BM_LOG.info("bed_mesh: remove_profile('%s') called" % prof_name)
         if prof_name in self.profiles:
             configfile = self.printer.lookup_object('configfile')
             configfile.remove_section('bed_mesh ' + prof_name)
             profiles = dict(self.profiles)
             del profiles[prof_name]
             self.profiles = profiles
+            _BM_LOG.info("bed_mesh: remove_profile('%s') — removed. "
+                         "Remaining profiles: [%s]"
+                         % (prof_name,
+                            ", ".join(self.profiles.keys()) if self.profiles
+                            else "<none>"))
             self.bedmesh.update_status()
             self.gcode.respond_info(
                 "Profile [%s] removed from storage for this session.\n"
                 "The SAVE_CONFIG command will update the printer\n"
                 "configuration and restart the printer" % (prof_name))
         else:
+            _BM_LOG.warning("bed_mesh: remove_profile('%s') — profile not found"
+                            % prof_name)
             self.gcode.respond_info(
                 "No profile named [%s] to remove" % (prof_name))
     cmd_BED_MESH_PROFILE_help = "Bed Mesh Persistent Storage management"

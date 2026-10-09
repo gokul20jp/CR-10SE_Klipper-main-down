@@ -298,6 +298,21 @@ class PrinterProbe:
         else:
             new_calibrate = self.z_offset - offset
             if new_calibrate < 0:
+                # LOG ONLY: z_offset was clamped to 0 (potential data loss)
+                # This can happen if the homing offset pushed z_offset negative.
+                # A negative z_offset may be valid in some nozzle-touch setups.
+                # Currently: silently clamped to 0. Monitoring via log for now.
+                import logging
+                logging.warning(
+                    "probe: Z_OFFSET_APPLY_PROBE computed negative z_offset "
+                    "new_calibrate=%.3f (from z_offset=%.3f, homing_offset=%.3f). "
+                    "Clamping to 0. If this appears frequently, "
+                    "investigate z_offset calibration accuracy."
+                    % (new_calibrate, self.z_offset, offset))
+                self.gcode.respond_info(
+                    "probe WARNING: Computed z_offset %.3f is negative — "
+                    "clamped to 0. Check klippy.log for details."
+                    % new_calibrate)
                 new_calibrate = 0
             self.gcode.respond_info(
                 "%s: z_offset: %.3f\n"
